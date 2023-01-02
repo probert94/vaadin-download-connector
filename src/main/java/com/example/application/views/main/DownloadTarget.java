@@ -4,18 +4,25 @@ import com.vaadin.flow.component.Component;
 import com.vaadin.flow.component.ComponentEvent;
 import com.vaadin.flow.component.ComponentUtil;
 import com.vaadin.flow.component.HasElement;
+import com.vaadin.flow.component.contextmenu.MenuItemBase;
 import com.vaadin.flow.component.dependency.JsModule;
+import com.vaadin.flow.component.page.PendingJavaScriptResult;
 import com.vaadin.flow.dom.Element;
 import com.vaadin.flow.server.Command;
 import com.vaadin.flow.server.StreamResource;
+import com.vaadin.flow.server.StreamResourceWriter;
+import com.vaadin.flow.shared.Registration;
 
 import java.util.Optional;
 import java.util.concurrent.CompletionStage;
 
 @JsModule("./src/download-connector.ts")
 public interface DownloadTarget<C extends Component> extends HasElement {
-	String ATTR_RESOURCE_LINK	= "resourceLink";
-	String PROP_ACTIVE			= "downloadActive";
+	String TOKEN_CAN_DOWNLOAD_REQUEST_REGISTRATION	= "CanDownloadRequestRegistration";
+	String ATTR_RESOURCE_LINK						= "resourceLink";
+	String PROP_ACTIVE								= "downloadActive";
+	String PROP_STOP_CLICK_EVENT_PROPAGATION		= "stopClickEventPropagation";
+	String PROP_CHECK_DOWNLOAD_ON_SERVER			= "checkDownloadOnServer";
 
 	@SuppressWarnings("unchecked")
 	default C getTargetComponent() {
@@ -28,10 +35,21 @@ public interface DownloadTarget<C extends Component> extends HasElement {
 	}
 
 	default void setResource(StreamResource resource) {
-		if (resource != null)
-			getElement().setAttribute(ATTR_RESOURCE_LINK, resource);
-		else
+		boolean stopClickEventPropagation = false;
+		if (resource == null)
 			getElement().removeAttribute(ATTR_RESOURCE_LINK);
+		else {
+			if (getTargetComponent() instanceof MenuItemBase<?,?,?> mi) {
+				stopClickEventPropagation = true;
+				StreamResourceWriter writer = resource.getWriter();
+				resource = new StreamResource(resource.getName(), (os, session) -> {
+					writer.accept(os, session);
+					mi.getUI().orElseThrow().access(() -> mi.getContextMenu().close());
+				});
+			}
+			getElement().setAttribute(ATTR_RESOURCE_LINK, resource);
+		}
+		getElement().setProperty(PROP_STOP_CLICK_EVENT_PROPAGATION, stopClickEventPropagation);
 	}
 
 	default void setResource(String resource) {
@@ -39,6 +57,38 @@ public interface DownloadTarget<C extends Component> extends HasElement {
 			getElement().setAttribute(ATTR_RESOURCE_LINK, resource);
 		else
 			getElement().removeAttribute(ATTR_RESOURCE_LINK);
+		getElement().setProperty(PROP_STOP_CLICK_EVENT_PROPAGATION, false);
+	}
+
+	default void setCanDownloadChecker(CanDownloadChecker downloadChecker) {
+		C component = getTargetComponent();
+		Object reg = ComponentUtil.getData(component, TOKEN_CAN_DOWNLOAD_REQUEST_REGISTRATION);
+		if (reg instanceof Registration registration)
+			registration.remove();
+		getElement().setProperty(PROP_CHECK_DOWNLOAD_ON_SERVER, downloadChecker != null);
+		if (downloadChecker == null)
+			ComponentUtil.setData(component, TOKEN_CAN_DOWNLOAD_REQUEST_REGISTRATION, null);
+		else {
+			Registration registration = getElement().addEventListener("can-download-request",
+				e -> downloadChecker.canDownload().whenCompleteAsync(
+					(r, exc) -> {
+						resolveCanDownload(r);
+						if (!r
+							&& getElement().getProperty(PROP_STOP_CLICK_EVENT_PROPAGATION, false)
+							&& getTargetComponent() instanceof MenuItemBase<?,?,?> mi)
+						{
+							mi.getContextMenu().close();
+						}
+					},
+					cmd -> component.getUI().orElseThrow().access(cmd::run)
+				)
+			);
+			ComponentUtil.setData(component, TOKEN_CAN_DOWNLOAD_REQUEST_REGISTRATION, registration);
+		}
+	}
+
+	private PendingJavaScriptResult resolveCanDownload(Boolean r) {
+		return getElement().executeJs("this.$downloadConnector.canDownloadChecked($0)", r != null && r);
 	}
 
 	default boolean isActive() {
@@ -80,12 +130,6 @@ public interface DownloadTarget<C extends Component> extends HasElement {
 
 	interface CanDownloadChecker {
 		CompletionStage<Boolean> canDownload();
-	}
-
-	class DownloadEndEvent<C extends Component> extends ComponentEvent<C> {
-		public DownloadEndEvent(C source, boolean fromClient) {
-			super(source, fromClient);
-		}
 	}
 
 	private static <T extends Component> DownloadTarget<T> create(T target) {
